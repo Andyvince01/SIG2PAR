@@ -1,3 +1,26 @@
+#--- GITIGNORE ---#
+
+# Ignore assets directory
+assets/
+configs/
+
+# Ignore data directory
+data/
+
+# Ignore logs directory
+logs/
+
+# Ignore models directory
+models/
+
+# Ignore .vscode directory
+.vscode/
+
+# Ignore .pth files
+*.pth
+
+#--- PYTHON ---#
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
