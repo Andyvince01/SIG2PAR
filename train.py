@@ -1,13 +1,154 @@
-import torch, os
+import torch
+import os
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.data import PARDataset
 from src.models import SIG2PAR
-from src.engine import Trainer, AsymmetricLoss
+from src.engine import AsymmetricLoss, Trainer, Validator
 from src.utils import *
 
-def main():
+class TrainingManager:
+    def __init__(self, model, optimizer, scheduler, max_patience=5):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.best_val_loss = float('inf')
+        self.patience = 0
+        self.max_patience = max_patience
+        self.device = next(model.parameters()).device
+        
+    def save_checkpoint(self, filename):
+        """
+        Save the model checkpoint.
+
+        Arguments:
+            - filename (str): The name of the file to save the checkpoint to.
+        """
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'scheduler_state_dict': self.scheduler.state_dict()
+        }
+        torch.save(checkpoint, filename)
+        LOGGER.debug(f"\t...{filename} model saved with validation loss: {self.best_val_loss:.4f}")
+    
+    def load_checkpoint(self, filename):
+        """
+        Load a checkpoint from a file.
+        
+        Arguments:
+            - filename (str): The name of the file to load the checkpoint from.
+        """
+        checkpoint = torch.load(filename, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        #--- Move optimizer state to the correct device ---#
+        optimizer_state = checkpoint['optimizer_state_dict']
+        for state in optimizer_state['state'].values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self.device)
+
+        self.optimizer.load_state_dict(optimizer_state)
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.best_val_loss = checkpoint['best_val_loss']
+        
+        del checkpoint
+        torch.cuda.empty_cache()
+        LOGGER.info(f"\t...checkpoint loaded from {filename}.")
+    
+    @staticmethod
+    def print_metrics(epoch, train_loss, val_loss, train_acc, val_acc, train_metrics, val_metrics):
+        """
+        Display training and validation metrics.
+        """
+        LOGGER.debug(
+            f'\n\tEPOCH ({epoch}) --> '
+            f'TRAINING LOSS: {train_loss:.4f}, '
+            f'TRAINING ACCURACY: {train_acc:.4f},\n' 
+            f'\t\tupper body loss: {train_metrics["upper_color"]["loss"]:.4f}, '
+            f'lower body loss: {train_metrics["lower_color"]["loss"]:.4f}, '
+            f'gender loss: {train_metrics["gender"]["loss"]:.4f}, '
+            f'bag loss: {train_metrics["bag"]["loss"]:.4f}, ' 
+            f'hat loss: {train_metrics["hat"]["loss"]:.4f}\n'
+            f'\t\tupper body acc: {train_metrics["upper_color"]["accuracy"]:.4f}, '
+            f'lower body acc: {train_metrics["lower_color"]["accuracy"]:.4f}, '
+            f'gender acc: {train_metrics["gender"]["accuracy"]:.4f}, '
+            f'bag acc: {train_metrics["bag"]["accuracy"]:.4f}, ' 
+            f'hat acc: {train_metrics["hat"]["accuracy"]:.4f}'
+        )
+        LOGGER.debug(
+            f'\tEPOCH ({epoch}) --> '
+            f'VALIDATION LOSS: {val_loss:.4f}, '
+            f'VALIDATION ACCURACY: {val_acc:.4f},\n' 
+            f'\t\tupper body loss: {val_metrics["upper_color"]["loss"]:.4f}, '
+            f'lower body loss: {val_metrics["lower_color"]["loss"]:.4f}, '
+            f'gender loss: {val_metrics["gender"]["loss"]:.4f}, '
+            f'bag loss: {val_metrics["bag"]["loss"]:.4f}, ' 
+            f'hat loss: {val_metrics["hat"]["loss"]:.4f}\n'
+            f'\t\tupper body acc: {val_metrics["upper_color"]["accuracy"]:.4f}, '
+            f'lower Body acc: {val_metrics["lower_color"]["accuracy"]:.4f}, '
+            f'gender acc: {val_metrics["gender"]["accuracy"]:.4f}, '
+            f'bag acc: {val_metrics["bag"]["accuracy"]:.4f}, ' 
+            f'hat acc: {val_metrics["hat"]["accuracy"]:.4f}'
+        )
+        
+    def train(self, trainer, validator, train_dataloader, val_dataloader, num_epochs, checkpoint_path='checkpoints'):
+        """
+        Train the model for a specified number of epochs.
+        
+        Arguments:
+            - trainer: The trainer object
+            - validator: The validator object
+            - train_dataloader: DataLoader for training data
+            - val_dataloader: DataLoader for validation data
+            - num_epochs: Number of epochs to train for
+            - checkpoint_path: Directory to save checkpoints in
+        """
+        os.makedirs(checkpoint_path, exist_ok=True)
+                
+        with Timer() as timer, GPUStats() as gpu_stats:
+            LOGGER.debug(f"► Training started with {gpu_stats.start_reserved} GB of memory reserved and {gpu_stats.start_allocated} GB allocated.")
+        
+            progress_bar = tqdm(range(num_epochs), desc="⭐ Epoch", leave=True, dynamic_ncols=True)
+            
+            for epoch in progress_bar:
+                # Training phase
+                train_loss, train_acc, train_metrics = trainer.run_epoch(train_dataloader)
+                
+                # Validation phase
+                val_loss, val_acc, val_metrics = validator.run_epoch(val_dataloader)
+                
+                # Update scheduler if needed
+                if getattr(self.scheduler, '__class__', None) and self.scheduler.__class__.__name__ != "OneCycleLR":
+                    self.scheduler.step(val_loss)
+                
+                # Print metrics
+                self.print_metrics(epoch, train_loss, val_loss, train_acc, val_acc, train_metrics, val_metrics)
+                
+                # Save checkpoints
+                last_checkpoint = os.path.join(checkpoint_path, 'last_model.pth')
+                self.save_checkpoint(last_checkpoint)
+                
+                # Early stopping check
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    best_checkpoint = os.path.join(checkpoint_path, 'best_model.pth')
+                    self.save_checkpoint(best_checkpoint)
+                    self.patience = 0
+                else:
+                    self.patience += 1
+                    if self.patience > self.max_patience:
+                        LOGGER.info('Early stopping triggered')
+                        break
+                    
+        LOGGER.debug(f"► Training finished with {gpu_stats.end_reserved} GB of memory reserved and {gpu_stats.end_allocated} GB allocated. Total time: {timer.duration:.4f} seconds.")
+
+def train():
     """ Main function to train the model. """
     # Initialize the Dataset
     train_dataset = PARDataset(
@@ -23,11 +164,15 @@ def main():
     )
 
     # Initialize the DataLoader
-    dataloader_params = {"batch_size": 64, "num_workers": 8, "pin_memory": True}
-    train_loader = DataLoader(train_dataset, shuffle=True, **dataloader_params)
-    val_loader = DataLoader(val_dataset, shuffle=False, **dataloader_params)
+    dataloader_params = {
+        "batch_size": 64,
+        "num_workers": 8, 
+        "pin_memory": True
+    }
+    train_dataloader = DataLoader(train_dataset, shuffle=True, **dataloader_params)
+    val_dataloader = DataLoader(val_dataset, shuffle=False, **dataloader_params)
 
-    # # Initialize the model and move it to the GPU if available
+    # Initialize the model and move it to the GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SIG2PAR().to(device)
 
@@ -48,169 +193,226 @@ def main():
         'hat': AsymmetricLoss(gamma_neg=0, gamma_pos=3, num_classes=1),
     }
 
-    # Define an optimizer and scheduler
-    num_epochs = 20
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=len(train_loader), epochs=num_epochs)
+    # Define parameter groups for optimizer
+    param_groups = [
+        # Group 1: Second-to-last and third-to-last layers
+        {'params': [
+            p for n, p in model.vision_model.named_parameters()
+            if n.startswith('encoder.layers') and int(n.split('.')[2]) in [len(model.vision_model.encoder.layers) - 3, len(model.vision_model.encoder.layers) - 2]
+        ], 'lr': 5e-6, 'weight_decay': 5e-5},
 
-    print(f"Train Loader size: {len(train_loader)} | Train Loader dataset size: {len(train_loader.dataset)}")
-    print(f"Validation Loader size: {len(val_loader)} | Validation Loader dataset size: {len(val_loader.dataset)}")
+        # Group 2: Final layer only
+        {'params': [
+            p for n, p in model.vision_model.named_parameters()
+            if n.startswith('encoder.layers') and int(n.split('.')[2]) == len(model.vision_model.encoder.layers) - 1
+        ], 'lr': 1e-5, 'weight_decay': 1e-4},
+        
+        # Group 3: Post LayerNorm and Head
+        {'params': [
+            p for n, p in model.vision_model.named_parameters()
+            if 'post_layernorm' in n or 'head' in n
+        ], 'lr': 2e-5, 'weight_decay': 1e-4},
+        
+        # Group 4: Task-specific heads
+        {'params': model.heads.parameters(), 'lr': 5e-4, 'weight_decay': 1e-4}
+    ]
 
-    # Initialize Trainer
+    # Set the optimizer to AdamW with weight decay    
+    optimizer = optim.AdamW(param_groups)
+    
+    # Set the learning rate scheduler to ReduceLROnPlateau
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5, 
+        patience=2, 
+        verbose=True
+    )
+    
+    # Initialize the Trainer and Validator
     trainer = Trainer(
         model=model,
         device=device,
         tasks=criterions.keys(),
         losses=criterions,
         optimizer=optimizer,
-        scheduler=scheduler,
-        num_epochs=num_epochs,
-        max_patience=7
+        scheduler=scheduler
+    )
+    
+    validator = Validator(
+        model=model,
+        device=device,
+        tasks=criterions.keys(),
+        losses=criterions,
     )
 
+    # Create training manager and start training
+    training_manager = TrainingManager(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        max_patience=5
+    )
+    
     # Start training
-    with GPUStats() as gpu_stats:
-        LOGGER.debug(f"► Training started with {gpu_stats.start_reserved} GB of memory reserved and {gpu_stats.start_allocated} GB allocated.")
-        trainer.fit(train_loader=train_loader, val_loader=val_loader)
+    training_manager.train(
+        trainer=trainer,
+        validator=validator,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        num_epochs=20,
+        checkpoint_path=CKPT_DIR
+    )
 
 if __name__ == '__main__':
-    # from torchview import draw_graph
-    # model_graph = draw_graph(MTANet(), input_size=(1, 3, 96, 288), expand_nested=True)
-    # filepath = model_graph.visual_graph.render(directory=script_dir, format='svg')
-
     torch.multiprocessing.set_start_method('spawn', force=True)
-    main()
+    train()
 
-# Epoch:   0%|                                                                                                                                                                     | 0/20 [00:00<?, ?it/s]
-#         EPOCH (0) --> TRAINING LOSS: 0.1084, TRAINING ACCURACY: 0.7755,
-#                 upper body loss: 0.1161, lower body loss: 0.0840, gender loss: 0.1287, bag loss: 0.1577, hat loss: 0.0554
-#                 upper body acc: 0.5983, lower body acc: 0.7053, gender acc: 0.8386, bag acc: 0.8178, hat acc: 0.9175
-#         EPOCH (0) --> VALIDATION LOSS: 0.0733, VALIDATION ACCURACY: 0.8665,
-#                 upper body loss: 0.0679, lower body loss: 0.0453, gender loss: 0.0872, bag loss: 0.1271, hat loss: 0.0389
-#                 upper body acc: 0.7757, lower Body acc: 0.8490, gender acc: 0.9092, bag acc: 0.8600, hat acc: 0.9384
-#         ...best model saved with validation loss: 0.0733
-# Epoch:   5%|███████▋                                                                                                                                                  | 1/20 [04:38<1:28:17, 278.82s/it]
-#         EPOCH (1) --> TRAINING LOSS: 0.0687, TRAINING ACCURACY: 0.8601,
-#                 upper body loss: 0.0744, lower body loss: 0.0530, gender loss: 0.0672, bag loss: 0.1138, hat loss: 0.0349
-#                 upper body acc: 0.7486, lower body acc: 0.8142, gender acc: 0.9220, bag acc: 0.8685, hat acc: 0.9475
-#         EPOCH (1) --> VALIDATION LOSS: 0.0616, VALIDATION ACCURACY: 0.8833,
-#                 upper body loss: 0.0611, lower body loss: 0.0391, gender loss: 0.0689, bag loss: 0.1121, hat loss: 0.0267
-#                 upper body acc: 0.8024, lower Body acc: 0.8678, gender acc: 0.9176, bag acc: 0.8804, hat acc: 0.9482
-#         ...best model saved with validation loss: 0.0616
-# Epoch:  10%|███████████████▍                                                                                                                                          | 2/20 [09:21<1:24:22, 281.24s/it] 
-#         EPOCH (2) --> TRAINING LOSS: 0.0614, TRAINING ACCURACY: 0.8737,
-#                 upper body loss: 0.0685, lower body loss: 0.0481, gender loss: 0.0583, bag loss: 0.1006, hat loss: 0.0313
-#                 upper body acc: 0.7678, lower body acc: 0.8305, gender acc: 0.9329, bag acc: 0.8836, hat acc: 0.9537
-#         EPOCH (2) --> VALIDATION LOSS: 0.0592, VALIDATION ACCURACY: 0.8884,
-#                 upper body loss: 0.0594, lower body loss: 0.0367, gender loss: 0.0743, bag loss: 0.1048, hat loss: 0.0210
-#                 upper body acc: 0.8164, lower Body acc: 0.8734, gender acc: 0.9120, bag acc: 0.8879, hat acc: 0.9524
-#         ...best model saved with validation loss: 0.0592
-# Epoch:  15%|███████████████████████                                                                                                                                   | 3/20 [13:51<1:18:09, 275.85s/it] 
-#         EPOCH (3) --> TRAINING LOSS: 0.0585, TRAINING ACCURACY: 0.8785,                                                                                                                                  
-#                 upper body loss: 0.0677, lower body loss: 0.0468, gender loss: 0.0537, bag loss: 0.0950, hat loss: 0.0295
-#                 upper body acc: 0.7718, lower body acc: 0.8357, gender acc: 0.9383, bag acc: 0.8924, hat acc: 0.9545
-#         EPOCH (3) --> VALIDATION LOSS: 0.0655, VALIDATION ACCURACY: 0.8618,
-#                 upper body loss: 0.0695, lower body loss: 0.0471, gender loss: 0.0728, bag loss: 0.1065, hat loss: 0.0316
-#                 upper body acc: 0.7817, lower Body acc: 0.8109, gender acc: 0.9213, bag acc: 0.8848, hat acc: 0.9105
-# Epoch:  20%|██████████████████████████████▊                                                                                                                           | 4/20 [18:21<1:13:00, 273.77s/it] 
-#         EPOCH (4) --> TRAINING LOSS: 0.0568, TRAINING ACCURACY: 0.8805,                                                                                                                                  
-#                 upper body loss: 0.0666, lower body loss: 0.0461, gender loss: 0.0520, bag loss: 0.0910, hat loss: 0.0285
-#                 upper body acc: 0.7736, lower body acc: 0.8375, gender acc: 0.9403, bag acc: 0.8951, hat acc: 0.9560
-#         EPOCH (4) --> VALIDATION LOSS: 0.0583, VALIDATION ACCURACY: 0.8798,
-#                 upper body loss: 0.0604, lower body loss: 0.0402, gender loss: 0.0685, bag loss: 0.0998, hat loss: 0.0226
-#                 upper body acc: 0.7889, lower Body acc: 0.8642, gender acc: 0.9211, bag acc: 0.8887, hat acc: 0.9360
-#         ...best model saved with validation loss: 0.0583
-# Epoch:  25%|██████████████████████████████████████▌                                                                                                                   | 5/20 [22:52<1:08:07, 272.50s/it] 
-#         EPOCH (5) --> TRAINING LOSS: 0.0533, TRAINING ACCURACY: 0.8865,                                                                                                                                  
-#                 upper body loss: 0.0645, lower body loss: 0.0444, gender loss: 0.0468, bag loss: 0.0848, hat loss: 0.0258
-#                 upper body acc: 0.7818, lower body acc: 0.8433, gender acc: 0.9461, bag acc: 0.9021, hat acc: 0.9591
-#         EPOCH (5) --> VALIDATION LOSS: 0.0562, VALIDATION ACCURACY: 0.8869,
-#                 upper body loss: 0.0538, lower body loss: 0.0399, gender loss: 0.0726, bag loss: 0.0920, hat loss: 0.0229
-#                 upper body acc: 0.8180, lower Body acc: 0.8615, gender acc: 0.9150, bag acc: 0.8957, hat acc: 0.9441
-#         ...best model saved with validation loss: 0.0562
-# Epoch:  30%|██████████████████████████████████████████████▏                                                                                                           | 6/20 [27:39<1:04:48, 277.76s/it] 
-#         EPOCH (6) --> TRAINING LOSS: 0.0492, TRAINING ACCURACY: 0.8921,                                                                                                                                  
-#                 upper body loss: 0.0614, lower body loss: 0.0426, gender loss: 0.0422, bag loss: 0.0762, hat loss: 0.0236
-#                 upper body acc: 0.7883, lower body acc: 0.8471, gender acc: 0.9516, bag acc: 0.9117, hat acc: 0.9618
-#         EPOCH (6) --> VALIDATION LOSS: 0.0570, VALIDATION ACCURACY: 0.8871,
-#                 upper body loss: 0.0562, lower body loss: 0.0398, gender loss: 0.0605, bag loss: 0.1000, hat loss: 0.0287
-#                 upper body acc: 0.8176, lower Body acc: 0.8673, gender acc: 0.9330, bag acc: 0.8905, hat acc: 0.9274
-# Epoch:  35%|█████████████████████████████████████████████████████▉                                                                                                    | 7/20 [32:30<1:01:03, 281.81s/it] 
-#         EPOCH (7) --> TRAINING LOSS: 0.0458, TRAINING ACCURACY: 0.8988,                                                                                                                                  
-#                 upper body loss: 0.0586, lower body loss: 0.0408, gender loss: 0.0384, bag loss: 0.0696, hat loss: 0.0214
-#                 upper body acc: 0.7979, lower body acc: 0.8531, gender acc: 0.9572, bag acc: 0.9197, hat acc: 0.9660
-#         EPOCH (7) --> VALIDATION LOSS: 0.0559, VALIDATION ACCURACY: 0.8968,
-#                 upper body loss: 0.0579, lower body loss: 0.0359, gender loss: 0.0630, bag loss: 0.1015, hat loss: 0.0210
-#                 upper body acc: 0.8251, lower Body acc: 0.8775, gender acc: 0.9301, bag acc: 0.8940, hat acc: 0.9571
-#         ...best model saved with validation loss: 0.0559
-# Epoch:  40%|██████████████████████████████████████████████████████████████▍                                                                                             | 8/20 [37:21<56:57, 284.78s/it] 
-#         EPOCH (8) --> TRAINING LOSS: 0.0406, TRAINING ACCURACY: 0.9080,                                                                                                                                  
-#                 upper body loss: 0.0551, lower body loss: 0.0388, gender loss: 0.0310, bag loss: 0.0591, hat loss: 0.0188
-#                 upper body acc: 0.8114, lower body acc: 0.8607, gender acc: 0.9653, bag acc: 0.9322, hat acc: 0.9706
-#         EPOCH (8) --> VALIDATION LOSS: 0.0556, VALIDATION ACCURACY: 0.8910,
-#                 upper body loss: 0.0581, lower body loss: 0.0366, gender loss: 0.0579, bag loss: 0.0945, hat loss: 0.0309
-#                 upper body acc: 0.8045, lower Body acc: 0.8742, gender acc: 0.9331, bag acc: 0.8990, hat acc: 0.9444
-#         ...best model saved with validation loss: 0.0556
-# Epoch:  45%|██████████████████████████████████████████████████████████████████████▏                                                                                     | 9/20 [41:53<51:28, 280.73s/it] 
-#         EPOCH (9) --> TRAINING LOSS: 0.0358, TRAINING ACCURACY: 0.9167,                                                                                                                                  
-#                 upper body loss: 0.0507, lower body loss: 0.0362, gender loss: 0.0259, bag loss: 0.0500, hat loss: 0.0160
-#                 upper body acc: 0.8250, lower body acc: 0.8681, gender acc: 0.9707, bag acc: 0.9440, hat acc: 0.9754
-#         EPOCH (9) --> VALIDATION LOSS: 0.0551, VALIDATION ACCURACY: 0.8966,
-#                 upper body loss: 0.0578, lower body loss: 0.0379, gender loss: 0.0571, bag loss: 0.0956, hat loss: 0.0270
-#                 upper body acc: 0.8153, lower Body acc: 0.8735, gender acc: 0.9360, bag acc: 0.9013, hat acc: 0.9569
-#         ...best model saved with validation loss: 0.0551
-# Epoch:  50%|█████████████████████████████████████████████████████████████████████████████▌                                                                             | 10/20 [46:21<46:10, 277.07s/it] 
-#         EPOCH (10) --> TRAINING LOSS: 0.0311, TRAINING ACCURACY: 0.9250,                                                                                                                                 
-#                 upper body loss: 0.0465, lower body loss: 0.0334, gender loss: 0.0212, bag loss: 0.0412, hat loss: 0.0132
-#                 upper body acc: 0.8372, lower body acc: 0.8771, gender acc: 0.9766, bag acc: 0.9538, hat acc: 0.9801
-#         EPOCH (10) --> VALIDATION LOSS: 0.0585, VALIDATION ACCURACY: 0.8949,
-#                 upper body loss: 0.0557, lower body loss: 0.0361, gender loss: 0.0692, bag loss: 0.1048, hat loss: 0.0265
-#                 upper body acc: 0.8278, lower Body acc: 0.8748, gender acc: 0.9191, bag acc: 0.8967, hat acc: 0.9560
-# Epoch:  55%|█████████████████████████████████████████████████████████████████████████████████████▎                                                                     | 11/20 [50:49<41:08, 274.27s/it] 
-#         EPOCH (11) --> TRAINING LOSS: 0.0262, TRAINING ACCURACY: 0.9350,                                                                                                                                 
-#                 upper body loss: 0.0415, lower body loss: 0.0301, gender loss: 0.0170, bag loss: 0.0319, hat loss: 0.0104
-#                 upper body acc: 0.8552, lower body acc: 0.8889, gender acc: 0.9811, bag acc: 0.9648, hat acc: 0.9850
-#         EPOCH (11) --> VALIDATION LOSS: 0.0600, VALIDATION ACCURACY: 0.8962,
-#                 upper body loss: 0.0594, lower body loss: 0.0385, gender loss: 0.0619, bag loss: 0.1151, hat loss: 0.0251
-#                 upper body acc: 0.8078, lower Body acc: 0.8795, gender acc: 0.9336, bag acc: 0.8988, hat acc: 0.9613
-# Epoch:  60%|█████████████████████████████████████████████████████████████████████████████████████████████                                                              | 12/20 [55:17<36:16, 272.09s/it] 
-#         EPOCH (12) --> TRAINING LOSS: 0.0215, TRAINING ACCURACY: 0.9452,                                                                                                                                 
-#                 upper body loss: 0.0355, lower body loss: 0.0265, gender loss: 0.0133, bag loss: 0.0243, hat loss: 0.0080
-#                 upper body acc: 0.8752, lower body acc: 0.9034, gender acc: 0.9853, bag acc: 0.9737, hat acc: 0.9886
-#         EPOCH (12) --> VALIDATION LOSS: 0.0616, VALIDATION ACCURACY: 0.8966,
-#                 upper body loss: 0.0593, lower body loss: 0.0404, gender loss: 0.0609, bag loss: 0.1142, hat loss: 0.0332
-#                 upper body acc: 0.8153, lower Body acc: 0.8734, gender acc: 0.9354, bag acc: 0.9005, hat acc: 0.9584
-# Epoch:  65%|████████████████████████████████████████████████████████████████████████████████████████████████████▊                                                      | 13/20 [59:43<31:33, 270.44s/it] 
-#         EPOCH (13) --> TRAINING LOSS: 0.0175, TRAINING ACCURACY: 0.9538,                                                                                                                                 
-#                 upper body loss: 0.0298, lower body loss: 0.0229, gender loss: 0.0102, bag loss: 0.0183, hat loss: 0.0061
-#                 upper body acc: 0.8929, lower body acc: 0.9157, gender acc: 0.9889, bag acc: 0.9803, hat acc: 0.9913
-#         EPOCH (13) --> VALIDATION LOSS: 0.0645, VALIDATION ACCURACY: 0.8929,
-#                 upper body loss: 0.0666, lower body loss: 0.0448, gender loss: 0.0612, bag loss: 0.1097, hat loss: 0.0403
-#                 upper body acc: 0.8087, lower Body acc: 0.8634, gender acc: 0.9382, bag acc: 0.8996, hat acc: 0.9543
-# Epoch:  70%|███████████████████████████████████████████████████████████████████████████████████████████████████████████                                              | 14/20 [1:04:10<26:55, 269.25s/it] 
-#         EPOCH (14) --> TRAINING LOSS: 0.0133, TRAINING ACCURACY: 0.9643,                                                                                                                                 
-#                 upper body loss: 0.0237, lower body loss: 0.0187, gender loss: 0.0076, bag loss: 0.0127, hat loss: 0.0040
-#                 upper body acc: 0.9159, lower body acc: 0.9319, gender acc: 0.9921, bag acc: 0.9868, hat acc: 0.9946
-#         EPOCH (14) --> VALIDATION LOSS: 0.0667, VALIDATION ACCURACY: 0.8965,
-#                 upper body loss: 0.0735, lower body loss: 0.0495, gender loss: 0.0690, bag loss: 0.1057, hat loss: 0.0360
-#                 upper body acc: 0.8101, lower Body acc: 0.8737, gender acc: 0.9387, bag acc: 0.9024, hat acc: 0.9575
-# Epoch:  75%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████▊                                      | 15/20 [1:08:36<22:21, 268.23s/it] 
-#         EPOCH (15) --> TRAINING LOSS: 0.0101, TRAINING ACCURACY: 0.9728,                                                                                                                                 
-#                 upper body loss: 0.0185, lower body loss: 0.0149, gender loss: 0.0059, bag loss: 0.0088, hat loss: 0.0026
-#                 upper body acc: 0.9359, lower body acc: 0.9473, gender acc: 0.9937, bag acc: 0.9910, hat acc: 0.9963
-#         EPOCH (15) --> VALIDATION LOSS: 0.0685, VALIDATION ACCURACY: 0.8964,
-# Epoch:  80%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▍                              | 16/20 [1:13:02<17:51, 267.79s/it] 
-#         EPOCH (16) --> TRAINING LOSS: 0.0078, TRAINING ACCURACY: 0.9792,
-#                 upper body loss: 0.0139, lower body loss: 0.0117, gender loss: 0.0050, bag loss: 0.0065, hat loss: 0.0017
-#                 upper body acc: 0.9512, lower body acc: 0.9592, gender acc: 0.9946, bag acc: 0.9935, hat acc: 0.9977
-#         EPOCH (16) --> VALIDATION LOSS: 0.0733, VALIDATION ACCURACY: 0.8948,
-#                 upper body loss: 0.0887, lower body loss: 0.0578, gender loss: 0.0638, bag loss: 0.1174, hat loss: 0.0387
-#                 upper body acc: 0.8084, lower Body acc: 0.8689, gender acc: 0.9381, bag acc: 0.8989, hat acc: 0.9595
-# Epoch:  85%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████                       | 17/20 [1:17:29<13:22, 267.36s/it] 
-#         EPOCH (17) --> TRAINING LOSS: 0.0060, TRAINING ACCURACY: 0.9843,
-#                 upper body loss: 0.0107, lower body loss: 0.0092, gender loss: 0.0042, bag loss: 0.0047, hat loss: 0.0012
-#                 upper body acc: 0.9631, lower body acc: 0.9690, gender acc: 0.9955, bag acc: 0.9954, hat acc: 0.9985
-#         EPOCH (17) --> VALIDATION LOSS: 0.0770, VALIDATION ACCURACY: 0.8965,
-#                 upper body loss: 0.1005, lower body loss: 0.0661, gender loss: 0.0652, bag loss: 0.1160, hat loss: 0.0373
-#                 upper body acc: 0.8135, lower Body acc: 0.8681, gender acc: 0.9395, bag acc: 0.9004, hat acc: 0.9612
+
+# [2025-05-02 00:14:28] (base) -  SIGPAR Model Initialized:  SIGPAR Model Summary
+# -------------------------
+# Vision Encoder: Siglip2VisionTransformer
+# Hidden Size:    1152
+
+#  Trainable Parameters:
+#   Total:   427,916,889
+#   Trainable: 60,987,993
+#   Frozen:    366,928,896
+# -------------------------
+# Train Loader size: 1278 | Train Loader dataset size: 81772
+# Validation Loader size: 145 | Validation Loader dataset size: 9219
+# [2025-05-02 00:14:28] (base) -  Training started with 1636.0 GB of memory reserved and 1632.380859375 GB allocated.
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [29:09<00:00,  1.37s/it, loss=0.263, accuracy=0.87]
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [29:06<00:00,  1.16s/it, loss=0.263, accuracy=0.87]
+#         EPOCH (0) --> TRAINING LOSS: 0.0570, TRAINING ACCURACY: 0.8704,
+#                 upper body loss: 0.0776, lower body loss: 0.0579, gender loss: 0.0376, bag loss: 0.0805, hat loss: 0.0314
+#                 upper body acc: 0.7372, lower body acc: 0.8045, gender acc: 0.9570, bag acc: 0.9044, hat acc: 0.9488
+#         EPOCH (0) --> VALIDATION LOSS: 0.0337, VALIDATION ACCURACY: 0.9232,
+#                 upper body loss: 0.0501, lower body loss: 0.0341, gender loss: 0.0265, bag loss: 0.0487, hat loss: 0.0090
+#                 upper body acc: 0.8320, lower Body acc: 0.8868, gender acc: 0.9720, bag acc: 0.9460, hat acc: 0.9791
+#         ...last_model.pth model saved with validation loss: inf
+#         ...best_model.pth model saved with validation loss: 0.0337
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [28:44<00:00,  1.35s/it, loss=0.259, accuracy=0.899]
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [28:43<00:00,  1.16s/it, loss=0.259, accuracy=0.899] 
+#         EPOCH (1) --> TRAINING LOSS: 0.0446, TRAINING ACCURACY: 0.8987,                                                                                                                             
+#                 upper body loss: 0.0576, lower body loss: 0.0436, gender loss: 0.0307, bag loss: 0.0674, hat loss: 0.0239
+#                 upper body acc: 0.8009, lower body acc: 0.8472, gender acc: 0.9647, bag acc: 0.9200, hat acc: 0.9609
+#         EPOCH (1) --> VALIDATION LOSS: 0.0337, VALIDATION ACCURACY: 0.9219,
+#                 upper body loss: 0.0501, lower body loss: 0.0322, gender loss: 0.0254, bag loss: 0.0518, hat loss: 0.0088
+#                 upper body acc: 0.8263, lower Body acc: 0.8893, gender acc: 0.9726, bag acc: 0.9396, hat acc: 0.9817
+#         ...last_model.pth model saved with validation loss: 0.0337
+#         ...best_model.pth model saved with validation loss: 0.0337
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [28:43<00:00,  1.35s/it, loss=0.203, accuracy=0.904]
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [28:41<00:00,  1.16s/it, loss=0.203, accuracy=0.904]
+#         EPOCH (2) --> TRAINING LOSS: 0.0417, TRAINING ACCURACY: 0.9044,
+#                 upper body loss: 0.0542, lower body loss: 0.0408, gender loss: 0.0290, bag loss: 0.0628, hat loss: 0.0218
+#                 upper body acc: 0.8110, lower body acc: 0.8548, gender acc: 0.9666, bag acc: 0.9255, hat acc: 0.9644
+#         EPOCH (2) --> VALIDATION LOSS: 0.0334, VALIDATION ACCURACY: 0.9250,
+#                 upper body loss: 0.0454, lower body loss: 0.0316, gender loss: 0.0281, bag loss: 0.0522, hat loss: 0.0099
+#                 upper body acc: 0.8422, lower Body acc: 0.8908, gender acc: 0.9734, bag acc: 0.9423, hat acc: 0.9762
+#         ...last_model.pth model saved with validation loss: 0.0337
+#         ...best_model.pth model saved with validation loss: 0.0334
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [28:40<00:00,  1.35s/it, loss=0.187, accuracy=0.908]
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [28:39<00:00,  1.16s/it, loss=0.187, accuracy=0.908]
+#         EPOCH (3) --> TRAINING LOSS: 0.0399, TRAINING ACCURACY: 0.9077,
+#                 upper body loss: 0.0522, lower body loss: 0.0391, gender loss: 0.0277, bag loss: 0.0601, hat loss: 0.0202
+#                 upper body acc: 0.8168, lower body acc: 0.8590, gender acc: 0.9681, bag acc: 0.9282, hat acc: 0.9663
+#         EPOCH (3) --> VALIDATION LOSS: 0.0347, VALIDATION ACCURACY: 0.9221,
+#                 upper body loss: 0.0481, lower body loss: 0.0312, gender loss: 0.0284, bag loss: 0.0544, hat loss: 0.0115
+#                 upper body acc: 0.8295, lower Body acc: 0.8900, gender acc: 0.9751, bag acc: 0.9427, hat acc: 0.9733
+#         ...last_model.pth model saved with validation loss: 0.0334
+# [2025-05-02 09:21:06] (base) -  Training started with 0.0 GB of memory reserved and 0.0 GB allocated.
+#         ...checkpoint loaded from last_model.pth.
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:14<00:00,  1.23s/it, loss=0.23, accuracy=0.911]
+# Training: 100%|████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:11<00:00,  1.06s/it, loss=0.23, accuracy=0.911]
+#         EPOCH (4) --> TRAINING LOSS: 0.0382, TRAINING ACCURACY: 0.9106,
+#                 upper body loss: 0.0502, lower body loss: 0.0380, gender loss: 0.0263, bag loss: 0.0576, hat loss: 0.0189
+#                 upper body acc: 0.8219, lower body acc: 0.8631, gender acc: 0.9692, bag acc: 0.9309, hat acc: 0.9681
+#         EPOCH (4) --> VALIDATION LOSS: 0.0335, VALIDATION ACCURACY: 0.9246,
+#                 upper body loss: 0.0458, lower body loss: 0.0307, gender loss: 0.0273, bag loss: 0.0525, hat loss: 0.0113
+#                 upper body acc: 0.8423, lower Body acc: 0.8924, gender acc: 0.9713, bag acc: 0.9414, hat acc: 0.9755
+#         ...last_model.pth model saved with validation loss: 0.0334
+# Training: 100%|███████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:07<00:00,  1.23s/it, loss=0.115, accuracy=0.913]
+# Training: 100%|███████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:06<00:00,  1.05s/it, loss=0.115, accuracy=0.913]
+#         EPOCH (5) --> TRAINING LOSS: 0.0368, TRAINING ACCURACY: 0.9132,
+#                 upper body loss: 0.0486, lower body loss: 0.0371, gender loss: 0.0250, bag loss: 0.0556, hat loss: 0.0177
+#                 upper body acc: 0.8265, lower body acc: 0.8651, gender acc: 0.9705, bag acc: 0.9338, hat acc: 0.9701
+#         EPOCH (5) --> VALIDATION LOSS: 0.0343, VALIDATION ACCURACY: 0.9228,
+#                 upper body loss: 0.0449, lower body loss: 0.0300, gender loss: 0.0281, bag loss: 0.0504, hat loss: 0.0183
+#                 upper body acc: 0.8438, lower Body acc: 0.8961, gender acc: 0.9702, bag acc: 0.9440, hat acc: 0.9601
+#         ...last_model.pth model saved with validation loss: 0.0334
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:27<00:00,  1.24s/it, loss=0.2, accuracy=0.919]
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:25<00:00,  1.06s/it, loss=0.2, accuracy=0.919]
+#         EPOCH (6) --> TRAINING LOSS: 0.0341, TRAINING ACCURACY: 0.9187,
+#                 upper body loss: 0.0462, lower body loss: 0.0352, gender loss: 0.0231, bag loss: 0.0506, hat loss: 0.0156
+#                 upper body acc: 0.8355, lower body acc: 0.8732, gender acc: 0.9722, bag acc: 0.9394, hat acc: 0.9731
+#         EPOCH (6) --> VALIDATION LOSS: 0.0324, VALIDATION ACCURACY: 0.9285,
+#                 upper body loss: 0.0435, lower body loss: 0.0301, gender loss: 0.0262, bag loss: 0.0540, hat loss: 0.0081
+#                 upper body acc: 0.8509, lower Body acc: 0.8933, gender acc: 0.9754, bag acc: 0.9402, hat acc: 0.9826
+#         ...last_model.pth model saved with validation loss: 0.0334
+#         ...best_model.pth model saved with validation loss: 0.0324
+# Training: 100%|███████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:24<00:00,  1.24s/it, loss=0.105, accuracy=0.921]
+# Training: 100%|███████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:22<00:00,  1.09s/it, loss=0.105, accuracy=0.921]
+#         EPOCH (7) --> TRAINING LOSS: 0.0332, TRAINING ACCURACY: 0.9207,
+#                 upper body loss: 0.0452, lower body loss: 0.0345, gender loss: 0.0223, bag loss: 0.0490, hat loss: 0.0147
+#                 upper body acc: 0.8395, lower body acc: 0.8753, gender acc: 0.9734, bag acc: 0.9408, hat acc: 0.9743
+#         EPOCH (7) --> VALIDATION LOSS: 0.0336, VALIDATION ACCURACY: 0.9252,
+#                 upper body loss: 0.0451, lower body loss: 0.0308, gender loss: 0.0306, bag loss: 0.0512, hat loss: 0.0103
+#                 upper body acc: 0.8434, lower Body acc: 0.8928, gender acc: 0.9678, bag acc: 0.9428, hat acc: 0.9790
+#         ...last_model.pth model saved with validation loss: 0.0324
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:25<00:00,  1.24s/it, loss=0.103, accuracy=0.922]
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:23<00:00,  1.05s/it, loss=0.103, accuracy=0.922] 
+#         EPOCH (8) --> TRAINING LOSS: 0.0322, TRAINING ACCURACY: 0.9218,                                                                                                                                  
+#                 upper body loss: 0.0445, lower body loss: 0.0339, gender loss: 0.0212, bag loss: 0.0470, hat loss: 0.0143
+#                 upper body acc: 0.8403, lower body acc: 0.8757, gender acc: 0.9740, bag acc: 0.9435, hat acc: 0.9753
+#         EPOCH (8) --> VALIDATION LOSS: 0.0331, VALIDATION ACCURACY: 0.9257,
+#                 upper body loss: 0.0458, lower body loss: 0.0303, gender loss: 0.0267, bag loss: 0.0518, hat loss: 0.0110
+#                 upper body acc: 0.8413, lower Body acc: 0.8934, gender acc: 0.9727, bag acc: 0.9438, hat acc: 0.9771
+#         ...last_model.pth model saved with validation loss: 0.0324
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:32<00:00,  1.25s/it, loss=0.139, accuracy=0.924]
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:31<00:00,  1.08s/it, loss=0.139, accuracy=0.924] 
+#         EPOCH (9) --> TRAINING LOSS: 0.0312, TRAINING ACCURACY: 0.9236,                                                                                                                                  
+#                 upper body loss: 0.0435, lower body loss: 0.0336, gender loss: 0.0204, bag loss: 0.0453, hat loss: 0.0131
+#                 upper body acc: 0.8438, lower body acc: 0.8768, gender acc: 0.9756, bag acc: 0.9451, hat acc: 0.9766
+#         EPOCH (9) --> VALIDATION LOSS: 0.0343, VALIDATION ACCURACY: 0.9242,
+#                 upper body loss: 0.0460, lower body loss: 0.0304, gender loss: 0.0282, bag loss: 0.0542, hat loss: 0.0126
+#                 upper body acc: 0.8390, lower Body acc: 0.8945, gender acc: 0.9706, bag acc: 0.9432, hat acc: 0.9740
+#         ...last_model.pth model saved with validation loss: 0.0324
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:55<00:00,  1.26s/it, loss=0.137, accuracy=0.927]
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:53<00:00,  1.08s/it, loss=0.137, accuracy=0.927] 
+#         EPOCH (10) --> TRAINING LOSS: 0.0297, TRAINING ACCURACY: 0.9268,                                                                                                                                 
+#                 upper body loss: 0.0423, lower body loss: 0.0324, gender loss: 0.0188, bag loss: 0.0426, hat loss: 0.0122
+#                 upper body acc: 0.8490, lower body acc: 0.8812, gender acc: 0.9769, bag acc: 0.9483, hat acc: 0.9788
+#         EPOCH (10) --> VALIDATION LOSS: 0.0339, VALIDATION ACCURACY: 0.9258,
+#                 upper body loss: 0.0459, lower body loss: 0.0301, gender loss: 0.0281, bag loss: 0.0561, hat loss: 0.0094
+#                 upper body acc: 0.8426, lower Body acc: 0.8922, gender acc: 0.9705, bag acc: 0.9421, hat acc: 0.9816
+#         ...last_model.pth model saved with validation loss: 0.0324
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:27<00:00,  1.24s/it, loss=0.186, accuracy=0.928]
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:26<00:00,  1.09s/it, loss=0.186, accuracy=0.928] 
+#         EPOCH (11) --> TRAINING LOSS: 0.0290, TRAINING ACCURACY: 0.9281,                                                                                                                                 
+#                 upper body loss: 0.0415, lower body loss: 0.0322, gender loss: 0.0185, bag loss: 0.0413, hat loss: 0.0117
+#                 upper body acc: 0.8518, lower body acc: 0.8822, gender acc: 0.9773, bag acc: 0.9501, hat acc: 0.9793
+#         EPOCH (11) --> VALIDATION LOSS: 0.0342, VALIDATION ACCURACY: 0.9266,
+#                 upper body loss: 0.0445, lower body loss: 0.0301, gender loss: 0.0291, bag loss: 0.0571, hat loss: 0.0104
+#                 upper body acc: 0.8460, lower Body acc: 0.8946, gender acc: 0.9704, bag acc: 0.9428, hat acc: 0.9794
+#         ...last_model.pth model saved with validation loss: 0.0324
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:43<00:00,  1.25s/it, loss=0.112, accuracy=0.929]
+# Training: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:40<00:00,  1.07s/it, loss=0.112, accuracy=0.929] 
+#         EPOCH (12) --> TRAINING LOSS: 0.0286, TRAINING ACCURACY: 0.9290,                                                                                                                                 
+#                 upper body loss: 0.0414, lower body loss: 0.0319, gender loss: 0.0183, bag loss: 0.0400, hat loss: 0.0114
+#                 upper body acc: 0.8520, lower body acc: 0.8838, gender acc: 0.9774, bag acc: 0.9523, hat acc: 0.9796
+#         EPOCH (12) --> VALIDATION LOSS: 0.0343, VALIDATION ACCURACY: 0.9255,
+#                 upper body loss: 0.0466, lower body loss: 0.0307, gender loss: 0.0286, bag loss: 0.0563, hat loss: 0.0092
+#                 upper body acc: 0.8398, lower Body acc: 0.8913, gender acc: 0.9715, bag acc: 0.9437, hat acc: 0.9813
+#         ...last_model.pth model saved with validation loss: 0.0324
+# Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:36<00:00,  1.25s/it, loss=0.124, accuracy=0.93]
+# Training: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 1278/1278 [26:34<00:00,  1.06s/it, loss=0.124, accuracy=0.93] 
+#         EPOCH (13) --> TRAINING LOSS: 0.0278, TRAINING ACCURACY: 0.9303,                                                                                                                                 
+#                 upper body loss: 0.0408, lower body loss: 0.0315, gender loss: 0.0174, bag loss: 0.0382, hat loss: 0.0108
+#                 upper body acc: 0.8532, lower body acc: 0.8841, gender acc: 0.9785, bag acc: 0.9540, hat acc: 0.9815
+#         EPOCH (13) --> VALIDATION LOSS: 0.0347, VALIDATION ACCURACY: 0.9255,
+#                 upper body loss: 0.0457, lower body loss: 0.0303, gender loss: 0.0284, bag loss: 0.0579, hat loss: 0.0112
+#                 upper body acc: 0.8437, lower Body acc: 0.8927, gender acc: 0.9709, bag acc: 0.9422, hat acc: 0.9782
+#         ...last_model.pth model saved with validation loss: 0.0324
 # Early stopping triggered
+# Epoch:  56%|█████████████████████████████████████████████████████████████████▊                                                   | 9/16 [4:56:25<3:50:33, 1976.19s/it]

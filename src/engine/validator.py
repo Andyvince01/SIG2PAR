@@ -4,62 +4,53 @@ from tqdm import tqdm
 from src.engine.base_runner import BaseRunner
 from src.utils import CKPT_DIR, LOGGER
 
-class Trainer(BaseRunner):
-    """ A class to train the model. It inherits from the BaseRunner class. """
-        
+class Validator(BaseRunner):
+    """ A class for validating a neural network model for multiple tasks. It inherits from the BaseRunner class. """
+    
     def __init__(self, 
         model: torch.nn.Module, 
         device: torch.device, 
         tasks: list, 
-        losses: dict, 
-        optimizer: torch.optim.Optimizer, 
-        scheduler: torch.optim.lr_scheduler._LRScheduler
+        losses: dict,
     ) -> None:
-        """Initializes the TrainNet class.
+        """Initializes the Validator class.
         
         Parameters
         ----------
         model : torch.nn.Module
-            The neural network model to be trained.
+            The neural network model to be validated.
         device : torch.device   
-            The device on which the training will be performed
+            The device on which the validation will be performed.
         tasks : list
             A list of task names, each corresponding to a specific output head of the model.
         losses : dict
             A dictionary mapping task names to loss functions for each task.
-        optimizer : torch.optim.Optimizer
-            The optimizer used for training the model.
-        scheduler : torch.optim.lr_scheduler._LRScheduler
-            The learning rate scheduler for training.
         """
-        super().__init__(model, device, tasks, losses, optimizer, scheduler)
+        super().__init__(model, device, tasks, losses)
         
+    @torch.inference_mode()
     def run_epoch(self, dataloader: torch.utils.data.DataLoader) -> dict[str, any]:
-        """ Train the model for one epoch.
+        """Evaluate the model for one validation epoch.
         
         Parameters
         ----------
         dataloader : torch.utils.data.DataLoader
-            DataLoader for the training or validation dataset.
+            DataLoader for the validation set.
         
         Returns
         -------
         dict[str, any]
             A dictionary containing the average loss and average metrics for the current epoch.
         """
-        #--- Set the model to TRAINING mode ---#
-        self.model.train()
+        #--- Set the model to EVALUATION mode ---#
+        self.model.eval()
 
         #--- Initialize the progress bar ---#
-        progress_bar = tqdm(dataloader, desc="🚀 Training Epoch...", dynamic_ncols=True, leave=False)
+        progress_bar = tqdm(dataloader, desc="🚀 Validating Epoch...", dynamic_ncols=True, leave=False)
 
         for batch_idx, samples in enumerate(progress_bar):
             #--- Get the inputs and labels ---#
-            inputs = samples['inputs'].to(self.device)
-            labels = {task: samples['attributes'][task].to(self.device) for task in self.tasks}
-
-            #--- Reset the gradients for the optimizer ---#
-            self.optimizer.zero_grad()
+            inputs, labels = samples['inputs'].to(self.device), samples['attributes'].to(self.device)
 
             #--- Forward pass with autocast for mixed precision ---#
             with torch.autocast(device_type="cuda"):
@@ -76,20 +67,7 @@ class Trainer(BaseRunner):
                                 
                 #--- Update the task metrics ---#
                 self.metrics.process_batch(outputs, labels, task_losses)
-                
-            #--- Backward & Optimizer Step ---#
-            if torch.isfinite(batch_loss):
-                self.scaler.scale(batch_loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                LOGGER.error(f"❌ Non-finite loss encountered: {batch_loss}")
-                raise ValueError(f"❌ Non-finite loss encountered: {batch_loss}")
-            
-            #--- Scheduler Step ---#
-            if isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
-                self.scheduler.step()
-
+    
             #--- Update the progress bar with the current loss and accuracy ---#
             progress_bar.set_postfix({
                 "📉 Loss": f"{batch_loss:.4f}",

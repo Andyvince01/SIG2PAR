@@ -1,10 +1,14 @@
 # >>> src/utils/__init__.py
 # Original author: Andrea Vincenzo Ricciardi
 
+import datetime
+import numpy as np
+import random
 import torch
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from src.utils.gpu_monitoring import GPUStats
+from src.utils.metrics import Metrics, MultiTaskMetrics
 from src.utils.timer import Timer
 from src.utils.logger import Logger
 
@@ -12,6 +16,7 @@ from src.utils.logger import Logger
 ROOT = Path(__file__).parent.parent.parent.resolve()
 
 LOGGER = Logger(log_name='base', log_level='ALL', on_file=ROOT / 'logs', on_screen=True)
+CKPT_DIR = ROOT / 'runs' / datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 color_to_int_map = {
     "N/A": -1,
@@ -52,7 +57,14 @@ int_to_bag_map = {value: key for key, value in bag_to_int_map.items()}
 int_to_hat_map = {value: key for key, value in hat_to_int_map.items()}
 
 # Set a torch seed
-torch.manual_seed(3)
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
 
 #--- Utility functions ---#
 @contextmanager
@@ -82,4 +94,4 @@ def context_if(condition: bool, context_factory: callable) -> contextmanager:
             
             
 #--- __all__ ---#
-__all__ = ["GPUStats", "context_if", "ROOT", "LOGGER", "Timer"]
+__all__ = ["GPUStats", "context_if", "ROOT", "LOGGER", "Timer", "Metrics", "MultiTaskMetrics", "CKPT_DIR"]
