@@ -5,7 +5,9 @@ assets/
 configs/
 
 # Ignore data directory
-data/
+data/mivia_par/
+data/old_mivia/
+data/PA100K/
 
 # Ignore logs directory
 logs/

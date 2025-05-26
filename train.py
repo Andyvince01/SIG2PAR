@@ -579,5 +579,5 @@ def _print_test_results(test_results: Dict[str, Any]) -> None:
 
 if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn', force=True)
-    # train(resume='runs/2025-05-24_20-18-05/last_model.pth')      # Set to a checkpoint path to resume training, or None to start fresh
-    test(checkpoint_path='runs/2025-05-24_20-18-05/best_model.pth', test_data_path=None)  # Set to a checkpoint path to test, or None to use validation set
+    train(resume=None)      # Set to a checkpoint path to resume training, or None to start fresh
+    # test(checkpoint_path='runs/2025-05-24_20-18-05/best_model.pth', test_data_path=None)  # Set to a checkpoint path to test, or None to use validation set
