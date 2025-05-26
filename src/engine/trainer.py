@@ -1,8 +1,7 @@
 import torch
 
-from tqdm import tqdm
 from src.engine.base_runner import BaseRunner
-from src.utils import CKPT_DIR, LOGGER
+from src.utils import LOGGER, TQDM
 
 class Trainer(BaseRunner):
     """ A class to train the model. It inherits from the BaseRunner class. """
@@ -13,7 +12,8 @@ class Trainer(BaseRunner):
         tasks: list, 
         losses: dict, 
         optimizer: torch.optim.Optimizer, 
-        scheduler: torch.optim.lr_scheduler._LRScheduler
+        scheduler: torch.optim.lr_scheduler._LRScheduler,
+        csv_dir : str = "runs/train/"
     ) -> None:
         """Initializes the TrainNet class.
         
@@ -32,13 +32,15 @@ class Trainer(BaseRunner):
         scheduler : torch.optim.lr_scheduler._LRScheduler
             The learning rate scheduler for training.
         """
-        super().__init__(model, device, tasks, losses, optimizer, scheduler)
-        
-    def run_epoch(self, dataloader: torch.utils.data.DataLoader) -> dict[str, any]:
+        super().__init__(model, device, tasks, losses, optimizer, scheduler, csv_dir)
+                
+    def run_epoch(self, epoch_idx: int, dataloader: torch.utils.data.DataLoader) -> dict[str, any]:
         """ Train the model for one epoch.
         
         Parameters
         ----------
+        epoch_idx : int
+            The current epoch index
         dataloader : torch.utils.data.DataLoader
             DataLoader for the training or validation dataset.
         
@@ -51,7 +53,7 @@ class Trainer(BaseRunner):
         self.model.train()
 
         #--- Initialize the progress bar ---#
-        progress_bar = tqdm(dataloader, desc="🚀 Training Epoch...", dynamic_ncols=True, leave=False)
+        progress_bar = TQDM(dataloader, desc=f"🏋️  Training Epoch no. {epoch_idx}")
 
         for batch_idx, samples in enumerate(progress_bar):
             #--- Get the inputs and labels ---#
@@ -97,4 +99,4 @@ class Trainer(BaseRunner):
             })
 
         #--- Return the average loss and metrics for the epoch ---#
-        return self.metrics.compute_metrics(save_csv=CKPT_DIR)['average']
+        return self.metrics.compute_metrics(epoch_idx=epoch_idx)

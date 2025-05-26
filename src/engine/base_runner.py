@@ -11,7 +11,8 @@ class BaseRunner(ABC):
         tasks: list, 
         losses: dict,
         optimizer: torch.optim.Optimizer | None = None,
-        scheduler: torch.optim.lr_scheduler._LRScheduler | None = None, 
+        scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
+        csv_dir : str = "runs/"
     ) -> None:
         """ Initialize the BaseRunner. It sets the model, device, tasks, losses, optimizer, scheduler, and number of epochs.
         
@@ -32,16 +33,16 @@ class BaseRunner(ABC):
         """
         self.model = model
         self.device = device
-        self.tasks = tasks
+        self.tasks = tasks.keys()
         self.losses = losses
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.scaler = torch.amp.GradScaler(enabled=True)
         self.patience = 0
         self.best_val_loss = float('inf')
-        self.metrics = MultiTaskMetrics(device=device)
+        self.metrics = MultiTaskMetrics(device=device, csv_dir=csv_dir, tasks=tasks)
 
     @abstractmethod
-    def run_epoch(self):
+    def run_epoch(self, epoch_idx: int, dataloader: torch.utils.data.DataLoader) -> dict[str, any]:
         """ This method should be implemented in subclasses to define the training and validation loop for each epoch. """
         pass

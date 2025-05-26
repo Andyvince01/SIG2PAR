@@ -8,28 +8,31 @@ from torch import nn
 from transformers import AutoImageProcessor, AutoConfig, Siglip2VisionModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 
-from src.utils import LOGGER
-
-TASKS = {
-    "upper_color": 11,
-    "lower_color": 11,
-    "gender": 1,
-    "bag": 1,
-    "hat": 1
-}
+from src.utils import LOGGER, TASKS
 
 class SIG2PAR(nn.Module):
     """ Class for the SIGPAR model. """
         
-    def __init__(self):
-        """ Initialize the SIGPAR model. """
+    def __init__(self, load_weights: bool = False, verbose : bool = False):
+        """ Initialize the SIGPAR model. 
+        
+        Parameters
+        ----------
+        load_weights : bool, optional
+            Whether to load pre-trained weights or not, by default False.
+        verbose : bool, optional
+            Whether to print the model summary or not, by default False.
+        """
         super(SIG2PAR, self).__init__()
         
         #--- Load the Vision Encoder model ---#
         config = AutoConfig.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE")
         self.processor = AutoImageProcessor.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE", use_fast=True)
-        vision_model = Siglip2VisionModel._from_config(config.vision_config)
-        # vision_model = Siglip2VisionModel.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE", device_map="auto")
+        
+        if not load_weights:
+            vision_model = Siglip2VisionModel.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE", device_map="auto")
+        else:
+            vision_model = Siglip2VisionModel._from_config(config.vision_config)
 
         self.vision_model = vision_model.vision_model
 
@@ -42,13 +45,13 @@ class SIG2PAR(nn.Module):
             for task, num_classes in TASKS.items()
         })        
         
-        
         del vision_model
         torch.cuda.empty_cache()
         LOGGER.debug(f"► SIGPAR Model Initialized.")
-        LOGGER.debug(f"{self.__str__()}")
+        if verbose:
+            LOGGER.debug(f"{self.__str__()}")
         
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(self, image : Image.Image) -> dict:
         """ Generate predictions for the input image using the SIGPAR model. 
         
@@ -64,15 +67,20 @@ class SIG2PAR(nn.Module):
         """
         #--- Process the image ---#
         inputs = self.processor(image, return_tensors="pt").to(self.device)
-        
+            
         #--- Forward pass through the model ---#
         outputs = self.forward(**inputs)
         
         #--- Get the predictions for each task ---#
-        return {
-            task: torch.argmax(logits, dim=1).item()
-            for task, logits in outputs.items()
-        }
+        predictions = {}
+        for task, logits in outputs.items():
+            # Multi-class classification tasks
+            if task in ["upper_color", "lower_color"]:
+                predictions[task] = int(torch.argmax(logits, dim=1).item()) + 1  # +1 to match the label encoding
+            # Binary classification tasks
+            else:
+                predictions[task] = int((torch.sigmoid(logits) > 0.5).item())
+        return predictions
         
     def forward(self,
         pixel_values: torch.Tensor | None = None,               # Pixel values of the image
@@ -93,9 +101,13 @@ class SIG2PAR(nn.Module):
         dict
             Dictionary containing the outputs for each task.
         """
-        pixel_values = pixel_values.squeeze(1) if pixel_values is not None and pixel_values.dim() == 4 else pixel_values
-        pixel_attention_mask = pixel_attention_mask.squeeze(1) if pixel_attention_mask is not None and pixel_attention_mask.dim() == 3 else None        
-        spatial_shapes = spatial_shapes.squeeze(1) if spatial_shapes is not None and spatial_shapes.dim() == 3 else None
+        #--- Handle tensor dimensions for single image vs batch of images ---#
+        if pixel_values is not None and pixel_values.dim() == 4:
+            pixel_values = pixel_values.squeeze(1)
+        if pixel_attention_mask is not None and pixel_attention_mask.dim() == 3:
+            pixel_attention_mask = pixel_attention_mask.squeeze(1)
+        if spatial_shapes is not None and spatial_shapes.dim() == 3:
+            spatial_shapes = spatial_shapes.squeeze(1)
                 
         #--- Forward pass through the vision model ---#
         outputs : BaseModelOutputWithPooling = self.vision_model(
@@ -113,12 +125,10 @@ class SIG2PAR(nn.Module):
         sequence_output = torch.mean(sequence_output, dim=1)
 
         #--- Forward pass through the task-specific classifier ---#
-        logits = {
+        return {
             task: head(sequence_output)
             for task, head in self.heads.items()
         }
-        
-        return logits
     
     @property
     def device(self) -> torch.device:

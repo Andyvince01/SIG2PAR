@@ -11,7 +11,7 @@ data/
 logs/
 
 # Ignore models directory
-models/
+# models/
 
 # Ignore .vscode directory
 .vscode/

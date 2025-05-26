@@ -1,33 +1,44 @@
-import json
+import os
 import torch
+from dataclasses import dataclass
 
-TASKS = {'upper_color': 11, "lower_color": 11, "gender": 1, "bag": 1, "hat": 1}
+@dataclass
+class MetricsConfig:
+    """ Configuration class for the metrics. """
+    task: str
+    nc: int
+    device: torch.device
+    csv_dir : str | None = None
+    
+    def __post_init__(self):
+        """ Post initialization to validate attributes. """
+        if self.nc <= 0:
+            raise ValueError(f"Number of classes must be positive, got {self.nc}.")
+        
+        self.csv = f"{self.csv_dir}/metrics_task_{self.task}.csv" if self.csv_dir else None
 
 class Metrics:
     """ Class to compute and store the metrics for a given task. """
-    def __init__(self, task : str, nc : int, device : torch.device):
+    def __init__(self, config: MetricsConfig):
         """ Initialize the metrics class.
         
         Parameters
         ----------
-        task : str
-            The name of the task.
-        nc : int    
-            The number of classes for the task.
-        device : torch.device
-            The device to use for the computations.
+        config : MetricsConfig
+            The configuration object for the metrics.
         """
-        self.task = task
-        self.nc = nc        
-        self.device = device
-
+        self.task = config.task
+        self.nc = config.nc
+        self.csv = config.csv
+        
+        # Initialize tracking variables
         self.loss = 0.0
         self.total_samples = 0
-        self.matrix = torch.zeros((nc, nc), dtype=torch.int64, device=self.device) if nc > 1 else torch.zeros((2, 2), dtype=torch.int64, device=self.device)
+        self.correct_predictions = 0
 
     @torch.inference_mode()
     def process_batch(self, outputs: torch.Tensor, labels: torch.Tensor, loss: torch.Tensor) -> None:
-        """ The function to process a batch of data. It updates the loss and the confusion matrix.
+        """ Process a batch of data and update metrics.
         
         Parameters
         ----------
@@ -38,106 +49,113 @@ class Metrics:
         loss : torch.Tensor
             The loss value.
         """
-        #--- Update the loss ---#
-        self.loss += loss.item() * labels.size(0)       # Multiply by batch size
-        self.total_samples += labels.size(0)            # Increment the total samples
+        batch_size = labels.size(0)
+        
+        # Update loss
+        self.loss += loss.item() * batch_size
+        self.total_samples += batch_size
 
-        #--- Update the confusion matrix ---#
+        # Update accuracy (more efficient than confusion matrix)
         if self.nc > 1:
-            preds = torch.argmax(outputs, dim=1).to(dtype=torch.int64)
+            preds = torch.argmax(outputs, dim=1)
         else:
-            preds = (torch.sigmoid(outputs) > 0.5).squeeze(1).to(dtype=torch.int64)
+            preds = (torch.sigmoid(outputs) > 0.5).squeeze(1).long()
 
-        # Convert labels to int64 if they are not already
-        labels = labels.to(dtype=torch.int64)
-
-        # Increment the confusion matrix
-        for t, p in zip(labels, preds):
-            self.matrix[t, p] += 1
+        # Count correct predictions
+        self.correct_predictions += (preds == labels).sum().item()
             
     @torch.inference_mode()
-    def compute_metrics(self, save_csv : str | None = None) -> dict:
-        """ Compute the metrics from the confusion matrix.
+    def compute_metrics(self, epoch_idx: int | None = None) -> dict:
+        """ Compute the metrics.
         
         Parameters
         ----------
-        save_csv : str | None
-            Whether to save the metrics to a CSV file or not.
+        epoch_idx : int | None
+            The index of the current processing epoch.
         
         Returns
         -------
         dict
-            A dictionary containing all the metrics computed for the current epoch.
-        """
-        #--- Check if save_csv is a boolean ---#
-        if isinstance(save_csv, bool) and save_csv:
-            raise ValueError("save_csv must be a string or None, not a boolean.")
-        
-        #--- Compute TP, TN, FP, FN ---#
-        TP = self.matrix.diag().float()
-        FP = self.matrix.sum(0).float() - TP           # Column sum - TP
-        FN = self.matrix.sum(1).float() - TP           # Row sum - TP
-        TN = self.matrix.sum().float() - (TP + FP + FN)
-        
-        #--- Compute metrics ---#
-        accuracy = TP.sum() / self.matrix.sum()
-        precision = torch.where((TP + FP) > 0, TP / (TP + FP), torch.zeros_like(TP, device=self.matrix.device))
-        recall = torch.where((TP + FN) > 0, TP / (TP + FN), torch.zeros_like(TP, device=self.matrix.device))
-        f1 = torch.where((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), torch.zeros_like(precision, device=self.matrix.device))
+            A dictionary containing the computed metrics.
+        """        
+        # Compute accuracy
+        accuracy = self.correct_predictions / max(self.total_samples, 1)
         
         # Normalize the epoch loss
-        self.loss /= self.total_samples
+        avg_loss = self.loss / max(self.total_samples, 1)
 
-        #--- Save the metrics to a CSV file if required ---#
+        # Create metrics dictionary (simplified)
         metrics = {
-            'loss': self.loss,
-            'accuracy': accuracy.mean().item(),
-            'precision': precision.mean().item(),
-            'recall': recall.mean().item(),
-            'f1': f1.mean().item(),
-            'TP': TP.sum().item(),
-            'TN': TN.sum().item(),
-            'FP': FP.sum().item(),
-            'FN': FN.sum().item()
+            'epoch': epoch_idx if epoch_idx is not None else -1,
+            'loss': avg_loss,
+            'accuracy': accuracy
         }
         
-        if save_csv:
-            with open(f"{save_csv}/metrics_task_{self.task}.json", 'a') as f:
-                # Save the metrics to a CSV file
-                json.dump(metrics, f, indent=4)
-        
-        #-- Return the metrics ---#
         return metrics
     
-    def reset(self) -> None:
-        """ Reset the metrics for the next epoch.
+    def _save_metrics(self, metrics: dict) -> None:
+        """ Save the metrics to a CSV file.
+                
+        Parameters
+        ----------
+        metrics : dict
+            The metrics to save.
         """
+        # Get the keys and values from the metrics dictionary
+        file_exists = os.path.exists(self.csv)
+        
+        with open(self.csv, "a", buffering=8192) as f:  # Use buffering
+            if not file_exists:
+                header = ",".join(f"{k:>15s}" for k in metrics.keys())
+                f.write(header + "\n")
+            
+            values = ",".join(f"{v:>15.5g}" if isinstance(v, float) else f"{v:>15d}" for v in metrics.values())
+            f.write(values + "\n")
+
+    def reset(self) -> None:
+        """ Reset the metrics for the next epoch. """
         self.loss = 0.0
         self.total_samples = 0
-        self.matrix.zero_(0)
-        
+        self.correct_predictions = 0
+
 class MultiTaskMetrics():
     """ Class to compute and store the metrics for multiple tasks. """
-    def __init__(self, device : torch.device):
+    def __init__(self, tasks: dict, device : torch.device, csv_dir : str = "runs/") -> None:
         """ Initialize the metrics class.
         
         Parameters
         ----------
+        tasks: dict 
+            A dictionary containing the tasks and their number of classes.
         device : torch.device
             The device to use for the computations.
+        csv_dir : str
+            The directory to save the CSV files.
         """
-        #--- Set the attributes ---#
-        self.device = device
-
-        #--- Initialize the metrics for each task ---#
+        self.csv_dir = csv_dir
+        self.tasks = tasks
+        
+        if self.csv_dir:
+            os.makedirs(self.csv_dir, exist_ok=True)
+        
+        # Initialize the metrics for each task
         self.metrics = {
-            task: Metrics(task=task, nc=nc, device=device) 
-            for task, nc in TASKS.items()
+            task: Metrics(
+                config=MetricsConfig(
+                    task=task,
+                    nc=nc,
+                    device=device,
+                    csv_dir=csv_dir
+                )
+            )
+            for task, nc in self.tasks.items()
         }
+        
+        self.epoch_idx = 0
         
     @torch.inference_mode()
     def process_batch(self, outputs: dict, labels: dict, loss: dict) -> None:
-        """ The function to process a batch of data. It updates the loss and the confusion matrix.
+        """ Process a batch of data for all tasks.
         
         Parameters
         ----------
@@ -148,52 +166,75 @@ class MultiTaskMetrics():
         loss : dict
             The loss value.
         """
-        #--- Update the metrics for each task ---#
-        for task in TASKS.keys():
+        for task in self.tasks.keys():
+            if task not in outputs or task not in labels or task not in loss:
+                raise ValueError(f"Task {task} not found in outputs, labels or loss.")
             self.metrics[task].process_batch(outputs[task], labels[task], loss[task])
             
     @torch.inference_mode()
-    def compute_metrics(self, save_csv : bool) -> dict:
-        """ Compute the metrics from the confusion matrix.
+    def compute_metrics(self, epoch_idx : int) -> dict:
+        """ Compute the metrics for all tasks.
         
         Parameters
         ----------
-        save_csv : bool
-            Whether to save the metrics to a CSV file or not.
+        epoch_idx : int
+            The current epoch to compute the metrics for.
         
         Returns
         -------
         dict
             A dictionary containing all the metrics computed for the current epoch.
         """        
-        #--- Compute the metrics for each task ---#
-        metrics = {
-            task: self.metrics[task].compute_metrics(save_csv=save_csv)
-            for task in TASKS.keys()
+        self.epoch_idx = epoch_idx
+        
+        # Compute the metrics for each task
+        results = {
+            task: self.metrics[task].compute_metrics(epoch_idx=epoch_idx)
+            for task in self.tasks.keys()
         }
         
-        #--- Compute the overall metrics ---#
-        average_accuracy = sum([metrics[task]['accuracy'] for task in TASKS.keys()]) / len(TASKS)
-        average_precision = sum([metrics[task]['precision'] for task in TASKS.keys()]) / len(TASKS)
-        average_recall = sum([metrics[task]['recall'] for task in TASKS.keys()]) / len(TASKS)
-        average_f1 = sum([metrics[task]['f1'] for task in TASKS.keys()]) / len(TASKS)
-        average_loss = sum([metrics[task]['loss'] for task in TASKS.keys()]) / len(TASKS)
+        # Compute the overall metrics (simplified)
+        num_tasks = len(self.tasks)
+        average_accuracy = sum(results[task]['accuracy'] for task in self.tasks.keys()) / num_tasks
+        average_loss = sum(results[task]['loss'] for task in self.tasks.keys()) / num_tasks
         
-        #--- Add the overall metrics to the dictionary ---#
-        metrics['average'] = {
+        # Add the overall metrics to the dictionary
+        results['average'] = {
             'loss': average_loss,
-            'accuracy': average_accuracy,
-            'precision': average_precision,
-            'recall': average_recall,
-            'f1': average_f1
+            'accuracy': average_accuracy
         }
         
-        if save_csv:
-            # Save the overall metrics to a CSV file
-            with open(f"{save_csv}/metrics_overall.json", 'w') as f:
-                json.dump(metrics['average'], f, indent=4)
+        # Save the overall metrics to a CSV file
+        if self.csv_dir:
+            self._save_metrics(results)                
+        return results
+    
+    def _save_metrics(self, results: dict) -> None:
+        """ Save metrics with optimized I/O. 
         
-        return metrics
+        Parameters
+        ----------
+        results : dict
+            A dictionary containing the metrics to save.
+        """
+        # Save overall metrics to a CSV file
+        csv_path = f"{self.csv_dir}/metrics_overall.csv"
+        file_exists = os.path.exists(csv_path)
+        
+        with open(csv_path, "a", buffering=8192) as f:
+            if not file_exists:
+                header = ",".join(f"{k:>15s}" for k in results['average'].keys())
+                f.write(header + "\n")
+            
+            values = ",".join(f"{v:>15.5g}" for v in results['average'].values())
+            f.write(values + "\n")
+            
+        # Save the metrics for each task
+        for task, metric in self.metrics.items():
+            metric._save_metrics({
+                'epoch': self.epoch_idx,
+                **results[task]
+            })
     
     @torch.inference_mode()
     def compute_average_accuracy(self) -> float:
@@ -204,37 +245,41 @@ class MultiTaskMetrics():
         float
             The average accuracy across all tasks.
         """
-        #--- Compute the average accuracy ---#
-        average_accuracy = sum([
-            self.metrics[task].compute_metrics()['accuracy'] for task in TASKS.keys()
-        ]) / len(TASKS)
+        average_accuracy = sum(
+            self.metrics[task].compute_metrics()['accuracy'] for task in self.tasks.keys()
+        ) / len(self.tasks)
         
         return average_accuracy
+    
+    def reset(self) -> None:
+        """ Reset the metrics for the next epoch. """
+        for task in self.tasks.keys():
+            self.metrics[task].reset()
         
+        self.epoch_idx = 0
+    
 if __name__ == "__main__":
-    # --- Example usage --- #
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Initialize the MultiTaskMetrics with the tasks
-    metrics = MultiTaskMetrics(device=device)
-
-    # --- Simulate some data --- #
-    batch_size = 8
+    
+    # Example usage
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tasks = {'task1': 2, 'task2': 3}
+    metrics = MultiTaskMetrics(tasks=tasks, device=device, csv_dir="runs/metrics")
+    
+    # Simulate a batch
     outputs = {
-        task: torch.randn(batch_size, nc).to(device)  # Simulate model outputs
-        for task, nc in TASKS.items()
+        'task1': torch.randn(10, 2, device=device),
+        'task2': torch.randn(10, 3, device=device)
     }
     labels = {
-        task: torch.randint(0, nc, (batch_size,)).to(device)  # Simulate labels
-        for task, nc in TASKS.items()
+        'task1': torch.randint(0, 2, (10,), device=device),
+        'task2': torch.randint(0, 3, (10,), device=device)
     }
-    losses = {
-        task: torch.randn(1).to(device)  # Simulate loss
-        for task in TASKS
+    loss = {
+        'task1': torch.tensor(0.5, device=device),
+        'task2': torch.tensor(0.7, device=device)
     }
-
-    # Process the simulated batch
-    metrics.process_batch(outputs, labels, losses)
-
-    # Compute and print the aggregated metrics
-    aggregated_metrics = metrics.compute_metrics(save_csv="runs/")
+    
+    metrics.process_batch(outputs, labels, loss)
+    results = metrics.compute_metrics(epoch_idx=1)
+    
+    print(results)
