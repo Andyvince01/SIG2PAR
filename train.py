@@ -249,7 +249,7 @@ def _create_criterions() -> Dict[str, AsymmetricLoss]:
     """Create loss functions for each task."""
     return {
         'upper_color': AsymmetricLoss(
-            gamma_neg=torch.tensor([1, 2, 4, 2, 3, 4, 4, 4, 2, 2, 4]), 
+            gamma_neg=torch.tensor([1, 2, 4, 2, 3, 5, 5, 5, 2, 2, 4]), 
             gamma_pos=torch.tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             num_classes=11
         ),
@@ -259,7 +259,7 @@ def _create_criterions() -> Dict[str, AsymmetricLoss]:
             num_classes=11
         ),
         'gender': AsymmetricLoss(gamma_neg=0, gamma_pos=2, num_classes=1),
-        'bag': AsymmetricLoss(gamma_neg=0, gamma_pos=2, num_classes=1),
+        'bag': AsymmetricLoss(gamma_neg=0, gamma_pos=3, num_classes=1),
         'hat': AsymmetricLoss(gamma_neg=0, gamma_pos=3, num_classes=1),
     }
 
@@ -270,25 +270,25 @@ def _create_optimizer_groups(model: SIG2PAR) -> list:
     num_layers = len(vision_layers)
     
     return [
-        # Group 1: Second-to-last and third-to-last layers
+        # Group 1: 4th-to-last and 5th-to-last layers
         {
             'params': [
                 p for n, p in model.vision_model.named_parameters()
                 if (n.startswith('encoder.layers') and 
-                    int(n.split('.')[2]) in [num_layers - 3, num_layers - 2])
+                    int(n.split('.')[2]) in [num_layers - 5, num_layers - 4])
             ], 
-            'lr': 5e-6, 
-            'weight_decay': 5e-5
+            'lr': 5e-6,            # dimezzato rispetto a prima
+            'weight_decay': 5e-5   # dimezzato rispetto a prima
         },
-        # Group 2: Final layer
+        # Group 2: 1st-to-last and 3rd-to-last layers
         {
             'params': [
                 p for n, p in model.vision_model.named_parameters()
                 if (n.startswith('encoder.layers') and 
-                    int(n.split('.')[2]) == num_layers - 1)
+                    int(n.split('.')[2]) in [num_layers - 3, num_layers - 1])
             ], 
-            'lr': 1e-5, 
-            'weight_decay': 1e-4
+            'lr': 1e-4,            # abbassato di 2 ordini di grandezza
+            'weight_decay': 1e-4   # ridotto un po' rispetto a 5e-3
         },
         # Group 3: Post LayerNorm and Head
         {
@@ -296,16 +296,17 @@ def _create_optimizer_groups(model: SIG2PAR) -> list:
                 p for n, p in model.vision_model.named_parameters()
                 if 'post_layernorm' in n or 'head' in n
             ], 
-            'lr': 2e-5, 
-            'weight_decay': 1e-4
+            'lr': 1e-5,            # dimezzato
+            'weight_decay': 5e-5   # dimezzato
         },
         # Group 4: Task-specific heads
         {
             'params': model.heads.parameters(), 
-            'lr': 5e-4, 
+            'lr': 1e-4,            # ridotto di circa 5 volte (più stabile)
             'weight_decay': 1e-4
         }
     ]
+
 
 
 def _create_dataloaders() -> tuple[DataLoader, DataLoader]:
@@ -327,7 +328,7 @@ def _create_dataloaders() -> tuple[DataLoader, DataLoader]:
 
     # DataLoader parameters
     dataloader_params = {
-        "batch_size": 64,
+        "batch_size": 84,
         "num_workers": min(8, os.cpu_count()), 
         "pin_memory": True,
         "persistent_workers": torch.cuda.is_available(),
@@ -377,11 +378,11 @@ def train(resume: Optional[str] = None) -> None:
     )
     
     # Determine checkpoint directory
-    if resume:
-        checkpoint_path = Path(resume)
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint {checkpoint_path} not found.")
-        CKPT_DIR = checkpoint_path.parent
+    # if resume:
+    #     checkpoint_path = Path(resume)
+    #     if not checkpoint_path.exists():
+    #         raise FileNotFoundError(f"Checkpoint {checkpoint_path} not found.")
+    #     CKPT_DIR = checkpoint_path.parent
     
     # Initialize trainer and validator
     trainer = Trainer(
@@ -391,7 +392,8 @@ def train(resume: Optional[str] = None) -> None:
         losses=criterions,
         optimizer=optimizer,
         scheduler=scheduler,
-        csv_dir=CKPT_DIR / "train"
+        csv_dir=CKPT_DIR / "train",
+        task_weights=TASK_WEIGHTS
     )
     
     validator = Validator(
@@ -399,7 +401,8 @@ def train(resume: Optional[str] = None) -> None:
         device=DEVICE,
         tasks=TASKS,
         losses=criterions,
-        csv_dir=CKPT_DIR / "val"
+        csv_dir=CKPT_DIR / "val",
+        task_weights=TASK_WEIGHTS
     )
 
     # Initialize training manager
@@ -578,6 +581,6 @@ def _print_test_results(test_results: Dict[str, Any]) -> None:
     LOGGER.info(f"\n{results}")
 
 if __name__ == '__main__':
-    torch.multiprocessing.set_start_method('spawn', force=True)
-    # train(resume='runs/2025-05-24_20-18-05/last_model.pth')      # Set to a checkpoint path to resume training, or None to start fresh
-    test(checkpoint_path='runs/2025-05-24_20-18-05/best_model.pth', test_data_path=None)  # Set to a checkpoint path to test, or None to use validation set
+    #torch.multiprocessing.set_start_method('spawn', force=True)
+    train()      # Set to a checkpoint path to resume training, or None to start fresh
+    #test(checkpoint_path='runs/2025-05-24_20-18-05/best_model.pth', test_data_path=None)  # Set to a checkpoint path to test, or None to use validation set
