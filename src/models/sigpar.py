@@ -5,10 +5,12 @@ import torch
 from collections import defaultdict
 from PIL import Image
 from torch import nn
-from transformers import AutoImageProcessor, AutoConfig, Siglip2VisionModel
+from transformers import AutoImageProcessor, AutoConfig, Siglip2VisionModel, Siglip2EncoderLayer
 from transformers.modeling_outputs import BaseModelOutputWithPooling
+import torch.nn.functional as F
 
-from src.utils import LOGGER, TASKS
+
+from src.utils import LOGGER, TASKS, TASK_CONFIG
 
 class SIG2PAR(nn.Module):
     """ Class for the SIGPAR model. """
@@ -26,13 +28,13 @@ class SIG2PAR(nn.Module):
         super(SIG2PAR, self).__init__()
         
         #--- Load the Vision Encoder model ---#
-        config = AutoConfig.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE")
+        self.config = AutoConfig.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE")
         self.processor = AutoImageProcessor.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE", use_fast=True)
         
         if not load_weights:
             vision_model = Siglip2VisionModel.from_pretrained("./models/siglip2-so400m-patch16-naflex_VE", device_map="auto")
         else:
-            vision_model = Siglip2VisionModel._from_config(config.vision_config)
+            vision_model = Siglip2VisionModel._from_config(self.config.vision_config)
 
         self.vision_model = vision_model.vision_model
 
@@ -40,16 +42,28 @@ class SIG2PAR(nn.Module):
         self.__set_trainable_layers()
 
         #--- Initialize the task-specific heads ---#
-        self.heads = nn.ModuleDict({
-            task: TaskHead(input_dim=vision_model.config.hidden_size, output_dim=num_classes)
-            for task, num_classes in TASKS.items()
-        })        
+        # self.heads = nn.ModuleDict({
+        #     task: TaskHead(input_dim=vision_model.config.hidden_size, output_dim=num_classes)
+        #     for task, num_classes in TASKS.items()
+        # })        
         
+        self.heads = nn.ModuleDict({
+        task: TaskHead(
+            input_dim=vision_model.config.hidden_size,
+            output_dim=TASKS[task],
+            hidden_dims=cfg['hidden_dims'],
+            dropout=0.3,
+            use_se=cfg['use_se']
+        )
+        for task, cfg in TASK_CONFIG.items()
+    })
+
+
+
         del vision_model
         torch.cuda.empty_cache()
         LOGGER.debug(f"► SIGPAR Model Initialized.")
-        if verbose:
-            LOGGER.debug(f"{self.__str__()}")
+        LOGGER.debug(f"{self.__str__()}")
         
     @torch.inference_mode()
     def generate(self, image : Image.Image) -> dict:
@@ -73,14 +87,16 @@ class SIG2PAR(nn.Module):
         
         #--- Get the predictions for each task ---#
         predictions = {}
+        logits_dict = {}
         for task, logits in outputs.items():
             # Multi-class classification tasks
             if task in ["upper_color", "lower_color"]:
                 predictions[task] = int(torch.argmax(logits, dim=1).item()) + 1  # +1 to match the label encoding
+                logits_dict[task] = logits
             # Binary classification tasks
             else:
                 predictions[task] = int((torch.sigmoid(logits) > 0.5).item())
-        return predictions
+        return predictions, logits_dict
         
     def forward(self,
         pixel_values: torch.Tensor | None = None,               # Pixel values of the image
@@ -139,7 +155,9 @@ class SIG2PAR(nn.Module):
         """ Post initialization method. """
         #--- Freeze the model parameters except for the last layers ---#        
         self.vision_model.requires_grad_(False)
-        self.vision_model.encoder.layers[-3:].requires_grad_(True)
+        self.vision_model.encoder.layers[-5:].requires_grad_(True)
+        for i in range(1,4):
+            self.vision_model.encoder.layers[-i]=Siglip2EncoderLayer(self.config.vision_config)
         self.vision_model.post_layernorm.requires_grad_(True)
         self.vision_model.head.requires_grad_(True)
         self.vision_model.head.requires_grad_(True)
@@ -229,49 +247,122 @@ class SIG2PAR(nn.Module):
 
         return "\n".join(lines)
 
-class TaskHead(nn.Module):
-    """ Class for the task-specific head. """
+# class TaskHead(nn.Module):
+#     """ Class for the task-specific head. """
     
-    def __init__(self, input_dim : int, output_dim : int, hidden_dim : int = 512, dropout : float = 0.3):
-        """ Initialize the task-specific head. 
+#     def __init__(self, input_dim : int, output_dim : int, hidden_dim : int = 512, dropout : float = 0.3):
+#         """ Initialize the task-specific head. 
         
-        Parameters
-        ----------
-        input_dim : int
-            Input dimension of the task head.
-        output_dim : int
-            Output dimension of the task head.
-        hidden_dim : int, optional
-            Hidden dimension of the task head, by default 512.
-        dropout : float, optional
-            Dropout rate of the task head, by default 0.3.
-        """
-        super(TaskHead, self).__init__()
+#         Parameters
+#         ----------
+#         input_dim : int
+#             Input dimension of the task head.
+#         output_dim : int
+#             Output dimension of the task head.
+#         hidden_dim : int, optional
+#             Hidden dimension of the task head, by default 512.
+#         dropout : float, optional
+#             Dropout rate of the task head, by default 0.3.
+#         """
+#         super(TaskHead, self).__init__()
         
-        #--- Set the classifier layers ---#
-        # self.classifier = nn.Sequential(
-        #     nn.Linear(in_features=input_dim, out_features=hidden_dim),
-        #     nn.SiLU(),
-        #     nn.Dropout(p=dropout),
-        #     nn.Linear(in_features=hidden_dim, out_features=output_dim),
-        # )
-        self.classifier = nn.Linear(in_features=input_dim, out_features=output_dim)
-        
-        
-    def forward(self, x : torch.Tensor) -> torch.Tensor:
-        """ Forward pass of the task head. 
-        
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor to the task head.
+#         #--- Set the classifier layers ---#
+#         intermediate_dim = hidden_dim // 2
+
+#         # self.classifier = nn.Sequential(
+#         #     nn.Linear(input_dim, hidden_dim),
+#         #     nn.SiLU(),
+#         #     nn.Dropout(p=dropout),
             
-        Returns
-        -------
-        torch.Tensor
-            Output tensor from the task head.
-        """
-        #--- Forward pass through the classifier layers ---#
+#         #     nn.LayerNorm(hidden_dim),
+#         #     nn.Linear(hidden_dim, intermediate_dim),
+#         #     nn.SiLU(),
+#         #     nn.Dropout(p=dropout),
+
+#         #     nn.LayerNorm(intermediate_dim),
+#         #     nn.Linear(intermediate_dim, output_dim)
+#         # )
+
+#         self.classifier = nn.Sequential(
+#             nn.Linear(input_dim, hidden_dim),
+#             nn.LayerNorm(hidden_dim),
+#             nn.GELU(),
+#             nn.Dropout(p=dropout),
+            
+#             nn.Linear(hidden_dim, intermediate_dim),
+#             nn.LayerNorm(intermediate_dim),
+#             nn.GELU(),
+#             nn.Dropout(p=dropout),
+
+#             nn.Linear(intermediate_dim, output_dim)
+#         )
+
+#         #self.classifier = nn.Linear(in_features=input_dim, out_features=output_dim)
+        
+        
+#     def forward(self, x : torch.Tensor) -> torch.Tensor:
+#         """ Forward pass of the task head. 
+        
+#         Parameters
+#         ----------
+#         x : torch.Tensor
+#             Input tensor to the task head.
+            
+#         Returns
+#         -------
+#         torch.Tensor
+#             Output tensor from the task head.
+#         """
+#         #--- Forward pass through the classifier layers ---#
+#         return self.classifier(x)
+
+class SEBlock(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super(SEBlock, self).__init__()
+        self.se = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.SiLU(),  # oppure nn.ReLU()
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: [B, C] oppure [B, T, C]
+        if x.dim() == 2:  # [B, C]
+            s = x
+        elif x.dim() == 3:  # [B, T, C]
+            s = x.mean(dim=1)  # Global average pooling sul tempo
+        else:
+            raise ValueError("Unsupported input shape for SEBlock")
+
+        scale = self.se(s)  # [B, C]
+        return x * scale.unsqueeze(1) if x.dim() == 3 else x * scale
+
+
+
+class TaskHead(nn.Module):
+    """Flexible task-specific head with customizable depth and width."""
+    def __init__(self, input_dim: int, output_dim: int, hidden_dims: list[int], dropout: float = 0.3, use_se: bool = False):
+        super(TaskHead, self).__init__()
+
+        layers = []
+        dims = [input_dim] + hidden_dims
+
+        for i in range(len(hidden_dims)):
+            layers.append(nn.Linear(dims[i], dims[i+1]))
+            layers.append(nn.LayerNorm(dims[i+1]))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(p=dropout))
+
+            if use_se:
+                layers.append(SEBlock(dims[i+1]))
+
+        # Output layer
+        layers.append(nn.Linear(dims[-1], output_dim))
+
+        self.classifier = nn.Sequential(*layers)
+
+    def forward(self, x):
         return self.classifier(x)
 
 if __name__ == '__main__':

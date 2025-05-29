@@ -44,6 +44,23 @@ TASKS = {
     "hat": len(ATTRIBUTE_MAPS["hat"]) - 2
 }
 
+TASK_WEIGHTS = {
+    "upper_color": 3.0,
+    "lower_color": 2.0,
+    "gender": 1.0,
+    "bag": 1.0,
+    "hat": 1.0
+}
+
+
+TASK_CONFIG = {
+    'upper_color':  {'hidden_dims': [1024, 768, 512], 'use_se': True},
+    'lower_color':  {'hidden_dims': [1024, 768, 512], 'use_se': True},
+    'gender':       {'hidden_dims': [512, 256],       'use_se': False},
+    'bag':          {'hidden_dims': [512, 256],       'use_se': False},
+    'hat':          {'hidden_dims': [512, 256],       'use_se': False}
+}
+
 #--- Set a random seed for reproducibility ---#
 def set_random_seed(seed: int = 42):
     """Set the random seed for reproducibility.
@@ -304,7 +321,7 @@ class TQDM2(tqdm.tqdm):
         return time.strftime("%H:%M:%S", time.gmtime(seconds))
 
 #--- __all__ ---#
-__all__ = ["GPUStats", "context_if", "ROOT", "LOGGER", "Timer", "Metrics", "MultiTaskMetrics", "CKPT_DIR", "TASKS", "TQDM", "set_random_seed", "DEVICE", "remove_text_model_weights"]
+__all__ = ["GPUStats", "context_if", "ROOT", "LOGGER", "Timer", "Metrics", "MultiTaskMetrics", "CKPT_DIR", "TASKS", "TASK_WEIGHTS", "TQDM", "set_random_seed", "DEVICE", "remove_text_model_weights"]
 
 if __name__ == "__main__":
     import random
